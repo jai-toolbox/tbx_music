@@ -1,22 +1,29 @@
 MELODY_ANCHOR :: 5;
 BREAKDOWN_LOW_PASS_HZ :: 800.0;
-INTRO_SECTION_BARS :: 8;
-BREAKDOWN_SECTION_BARS :: 16;
-GROOVE_SECTION_BARS :: 24;
-GROOVE_START_BAR :: 0;
-SYNTH_PATTERN_START_BAR :: GROOVE_START_BAR + 8;
-BASS_START_BAR :: SYNTH_PATTERN_START_BAR + 8;
-BREAKDOWN_START_BAR :: GROOVE_START_BAR + GROOVE_SECTION_BARS;
-INTRO_START_BAR :: BREAKDOWN_START_BAR + BREAKDOWN_SECTION_BARS;
+NOTE_EVENT_MAX_NOTES :: 8;
 
-Melody_Event :: struct {
-    step_offset: int;
-    relative_note: int;
+Note_Duration_Mode :: enum {
+    FIXED;
+    UNTIL_NEXT_NOTE;
+}
+
+Note_Event_Kind :: enum {
+    NOTE;
+    REST;
+}
+
+Note_Event :: struct {
+    sixteenth_offset: int;
+    kind: Note_Event_Kind;
+    note_count: int;
+    relative_notes: [NOTE_EVENT_MAX_NOTES] int;
+    duration_mode: Note_Duration_Mode;
+    duration_sixteenths: float;
 }
 
 Render_Config :: struct {
     bpm: int = 135;
-    bars: int = GROOVE_SECTION_BARS + BREAKDOWN_SECTION_BARS + INTRO_SECTION_BARS;
+    bars: int = 70;
     output_path: string = "out/song.wav";
 }
 
@@ -27,6 +34,9 @@ Noise_State :: struct {
 main :: () {
     if maybe_run_reverb_oracle() return;
     if maybe_run_low_pass_oracle() return;
+    if maybe_run_debug_sine() return;
+    if maybe_run_debug_synth_events() return;
+    if maybe_run_debug_synth_pulse() return;
 
     config := parse_args();
 
@@ -47,6 +57,80 @@ main :: () {
     seconds := cast(float) samples.count / cast(float) SAMPLE_RATE_HZ;
     print("Wrote % (% bpm, % bars, % samples, % seconds)\n", config.output_path, config.bpm, config.bars, samples.count, seconds);
     print("Try: aplay %\n", config.output_path);
+}
+
+maybe_run_debug_synth_pulse :: () -> bool {
+    args := get_command_line_arguments();
+    defer array_reset(*args);
+
+    if args.count < 2 return false;
+    if args[1] != "--debug-synth-pulse" return false;
+
+    events := parse_note_pattern(synth_pulse_pattern_notation(), .FIXED, 0.78);
+    defer array_free(events);
+
+    phrase_length_sixteenths := count_note_pattern_sixteenths(synth_pulse_pattern_notation());
+    print("pulse phrase length=% sixteenths (% bars)\n", phrase_length_sixteenths, cast(float) phrase_length_sixteenths / 16.0);
+
+    for event_index: 0..events.count - 1 {
+        event := events[event_index];
+        print("pulse % offset=% kind=% note_count=% first_note=% mode=% duration_sixteenths=%\n", event_index, event.sixteenth_offset, event.kind, event.note_count, event.relative_notes[0], event.duration_mode, event.duration_sixteenths);
+    }
+
+    return true;
+}
+
+maybe_run_debug_synth_events :: () -> bool {
+    args := get_command_line_arguments();
+    defer array_reset(*args);
+
+    if args.count < 2 return false;
+    if args[1] != "--debug-synth-events" return false;
+
+    events := parse_note_pattern(synth_pattern_notation(), .UNTIL_NEXT_NOTE, 0.0);
+    defer array_free(events);
+    phrase_length_sixteenths := 4 * 16;
+    for event_index: 0..events.count - 1 {
+        event := events[event_index];
+        duration := note_event_duration_sixteenths(events, event_index, phrase_length_sixteenths);
+        print("event % offset=% kind=% note_count=% first_note=% mode=% duration_sixteenths=%\n", event_index, event.sixteenth_offset, event.kind, event.note_count, event.relative_notes[0], event.duration_mode, duration);
+    }
+
+    return true;
+}
+
+maybe_run_debug_sine :: () -> bool {
+    args := get_command_line_arguments();
+    defer array_reset(*args);
+
+    if args.count < 2 return false;
+    if args[1] != "--debug-sine" return false;
+
+    output_path := "out/sine.wav";
+    seconds := 3.0;
+    frequency := 440.0;
+    amp := 0.80;
+
+    if args.count >= 3 output_path = args[2];
+
+    sample_count := cast(int) ceil(seconds * cast(float) SAMPLE_RATE_HZ);
+    samples: [..] float;
+    array_resize(*samples, sample_count);
+    defer array_free(samples);
+
+    for i: 0..sample_count - 1 {
+        t := cast(float) i / cast(float) SAMPLE_RATE_HZ;
+        samples[i] = amp * sin(TAU * frequency * t);
+    }
+
+    success := write_wav_16_mono(output_path, samples);
+    if !success {
+        print("Failed to write debug sine: %\n", output_path);
+        return true;
+    }
+
+    print("Wrote debug sine % (% Hz, amp %, % samples)\n", output_path, frequency, amp, sample_count);
+    return true;
 }
 
 maybe_run_reverb_oracle :: () -> bool {
@@ -196,6 +280,7 @@ parse_args :: () -> Render_Config {
 print_usage :: () {
     print("tbx_music: synthesize a small kick + snare + hihat + sine synth beat to WAV.\n");
     print("Usage: bin/tbx_music [--bpm 135] [--bars 47] [--out out/song.wav]\n");
+    print("       bin/tbx_music --debug-sine [out/sine.wav]\n");
 }
 
 render_song :: (bpm: int, bars: int) -> [..] float {
@@ -224,36 +309,131 @@ render_song :: (bpm: int, bars: int) -> [..] float {
     defer array_free(breakdown_drums);
     for 0..breakdown_drums.count - 1 breakdown_drums[it] = 0.0;
 
-    for step: 0..total_sixteenths - 1 {
+    breakdown_melody: [..] float;
+    array_resize(*breakdown_melody, total_samples);
+    defer array_free(breakdown_melody);
+    for 0..breakdown_melody.count - 1 breakdown_melody[it] = 0.0;
 
-        t := cast(float) step * seconds_per_sixteenth;
-        beat_in_bar := (step / 4) % 4;
-        sixteenth_in_beat := step % 4;
-        bar_index := step / sixteenths_per_bar;
-        is_breakdown_bar := bar_index >= BREAKDOWN_START_BAR && bar_index < INTRO_START_BAR;
-        drum_bus := ifx is_breakdown_bar then breakdown_drums else samples;
+    breakdown_sparks: [..] float;
+    array_resize(*breakdown_sparks, total_samples);
+    defer array_free(breakdown_sparks);
+    for 0..breakdown_sparks.count - 1 breakdown_sparks[it] = 0.0;
 
-        // Sixteenth-note hihat, with occasional 32nd-note fills on one beat of the bar.
-        if !is_breakdown_bar {
-            amp := ifx sixteenth_in_beat == 0 then 0.24 else 0.16;
+    intro_melody: [..] float;
+    array_resize(*intro_melody, total_samples);
+    defer array_free(intro_melody);
+    for 0..intro_melody.count - 1 intro_melody[it] = 0.0;
+
+    dry_synth: [..] float;
+    array_resize(*dry_synth, total_samples);
+    defer array_free(dry_synth);
+    for 0..dry_synth.count - 1 dry_synth[it] = 0.0;
+
+    reverbed_synth: [..] float;
+    array_resize(*reverbed_synth, total_samples);
+    defer array_free(reverbed_synth);
+    for 0..reverbed_synth.count - 1 reverbed_synth[it] = 0.0;
+
+    bass: [..] float;
+    array_resize(*bass, total_samples);
+    defer array_free(bass);
+    for 0..bass.count - 1 bass[it] = 0.0;
+
+    spark_noise: Noise_State;
+    spark_noise.value = 0x62F3A91D;
+
+    synth_events := parse_note_pattern(synth_pattern_notation(), .UNTIL_NEXT_NOTE, 0.0);
+    defer array_free(synth_events);
+    intro_melody_events := parse_note_pattern(intro_melody_phrase_notation(), .UNTIL_NEXT_NOTE, 0.0);
+    defer array_free(intro_melody_events);
+    synth_pulse_events := parse_note_pattern(synth_pulse_pattern_notation(), .FIXED, 0.78);
+    defer array_free(synth_pulse_events);
+    synth_pulse_phrase_sixteenths := count_note_pattern_sixteenths(synth_pulse_pattern_notation());
+    bass_events := parse_note_pattern(bass_pattern_notation(), .FIXED, 15.5);
+    defer array_free(bass_events);
+    bass_phrase_sixteenths := count_note_pattern_sixteenths(bass_pattern_notation());
+    breakdown_melody_events := parse_note_pattern(breakdown_melody_notation(), .FIXED, 3.84);
+    defer array_free(breakdown_melody_events);
+    breakdown_melody_phrase_sixteenths := count_note_pattern_sixteenths(breakdown_melody_notation());
+
+    for current_sixteenth: 0..total_sixteenths - 1 {
+
+        current_seconds := cast(float) current_sixteenth * seconds_per_sixteenth;
+        beat_index_in_bar := (current_sixteenth / 4) % 4;
+        sixteenth_index_in_beat := current_sixteenth % 4;
+        bar_index := current_sixteenth / sixteenths_per_bar;
+        sixteenth_index_in_bar := current_sixteenth % sixteenths_per_bar;
+
+        // sixteenth-note hihat, with occasional 32nd-note fills on one beat of the bar.
+        if !(bar_index >= 24 && bar_index <= 39 || bar_index >= 63) {
+            amp := ifx sixteenth_index_in_beat == 0 then 0.24 else 0.16;
             fill_beat := hihat_fill_beat_for_bar(bar_index);
-            if beat_in_bar == fill_beat {
-                add_hihat(hihat, t, 0.026, amp * 0.88, *noise);
-                add_hihat(hihat, t + seconds_per_sixteenth * 0.5, 0.026, amp * 0.74, *noise);
+            if beat_index_in_bar == fill_beat {
+                if beat_index_in_bar % 3 == 0 {
+                    add_hihat(hihat, current_seconds, 0.013, amp * 0.88, *noise);
+                    add_hihat(hihat, current_seconds + seconds_per_sixteenth * 0.25, 0.016, amp * 0.74, *noise);
+                    add_hihat(hihat, current_seconds + 2 * seconds_per_sixteenth * 0.25, 0.016, amp * 0.74, *noise);
+                    add_hihat(hihat, current_seconds + 3 * seconds_per_sixteenth * 0.25, 0.016, amp * 0.74, *noise);
+                } else {
+                    add_hihat(hihat, current_seconds, 0.026, amp * 0.88, *noise);
+                    add_hihat(hihat, current_seconds + seconds_per_sixteenth * 0.5, 0.026, amp * 0.74, *noise);
+                }
             } else {
-                add_hihat(hihat, t, 0.045, amp, *noise);
+                add_hihat(hihat, current_seconds, 0.045, amp, *noise);
             }
         }
 
-        // Bass drum on 1, 2&, and 3&.
-        step_in_bar := step % sixteenths_per_bar;
-        if step_in_bar == 0 || step_in_bar == 6 || step_in_bar == 10 {
-            add_kick(drum_bus, t, 0.95);
+        // bass drum on 1, 2&, and 3&.
+        if sixteenth_index_in_bar == 0 || sixteenth_index_in_bar == 6 || sixteenth_index_in_bar == 10 {
+            if bar_index >= 24 && bar_index <= 39 {
+                add_kick(breakdown_drums, current_seconds, 0.95);
+            } else {
+                add_kick(samples, current_seconds, 0.95);
+            }
         }
 
-        // Backbeat spark on beats 2 and 4.
-        if sixteenth_in_beat == 0 && (beat_in_bar == 1 || beat_in_bar == 3) {
-            add_spark(drum_bus, t, 0.85, *noise);
+        // backbeat spark on beats 2 and 4.
+        if sixteenth_index_in_beat == 0 && (beat_index_in_bar == 1 || beat_index_in_bar == 3) {
+            if bar_index >= 24 && bar_index <= 39 {
+                add_spark(breakdown_drums, current_seconds, 0.85, *noise);
+            } else {
+                add_spark(samples, current_seconds, 0.85, *noise);
+            }
+        }
+
+        // bars 25-40: breakdown melody.
+        if bar_index >= 24 && bar_index <= 39 {
+            breakdown_sixteenth_index := (current_sixteenth - (25 - 1) * sixteenths_per_bar) % breakdown_melody_phrase_sixteenths;
+            add_matching_note_event(breakdown_melody, breakdown_melody_events, breakdown_sixteenth_index, current_sixteenth, breakdown_melody_phrase_sixteenths, seconds_per_sixteenth, total_sixteenths, 0.23);
+        }
+
+        // bars 37-40: extra bright hits into the end of the breakdown.
+        if bar_index >= 36 && bar_index <= 39 && sixteenth_index_in_beat == 0 {
+            add_spark(breakdown_sparks, current_seconds, 0.54, *spark_noise);
+        }
+
+        // bars 41+: hyper sixteenth sine melody, repeating every four bars.
+        if bar_index >= 40 && bar_index <= 47   {
+            phrase_sixteenth_index := (current_sixteenth - (41 - 1) * sixteenths_per_bar) % (4 * sixteenths_per_bar);
+            add_matching_note_event(intro_melody, intro_melody_events, phrase_sixteenth_index, current_sixteenth, 4 * sixteenths_per_bar, seconds_per_sixteenth, total_sixteenths, 0.23);
+        }
+
+        // bars 1-24: dry pulse synth over the groove.
+        if bar_index >= 0 && bar_index <= 23 {
+            synth_pulse_sixteenth_index := current_sixteenth % synth_pulse_phrase_sixteenths;
+            add_matching_note_event(dry_synth, synth_pulse_events, synth_pulse_sixteenth_index, current_sixteenth, synth_pulse_phrase_sixteenths, seconds_per_sixteenth, total_sixteenths, 0.26);
+        }
+
+        // bars 9-24: reverb synth pattern. do do do do 
+        if bar_index >= 8 && bar_index <= 23 || bar_index >= 48 && bar_index <= 63  {
+            pattern_sixteenth_index := (current_sixteenth - (9 - 1) * sixteenths_per_bar) % (4 * sixteenths_per_bar);
+            add_matching_note_event(reverbed_synth, synth_events, pattern_sixteenth_index, current_sixteenth, 4 * sixteenths_per_bar, seconds_per_sixteenth, total_sixteenths, 0.20);
+        }
+
+        // bars 17-40: bass notes begin later in the groove and continue through the breakdown.
+        if bar_index >= 16 && bar_index <= 39 || bar_index >= 48 {
+            bass_sixteenth_index := (current_sixteenth - (17 - 1) * sixteenths_per_bar) % bass_phrase_sixteenths;
+            add_matching_bass_event(bass, bass_events, bass_sixteenth_index, current_sixteenth, bass_phrase_sixteenths, seconds_per_sixteenth, total_sixteenths, 0.34);
         }
     }
 
@@ -262,48 +442,20 @@ render_song :: (bpm: int, bars: int) -> [..] float {
     for i: 0..samples.count - 1 samples[i] += hihat[i];
     for i: 0..samples.count - 1 samples[i] += breakdown_drums[i];
 
-    breakdown_melody: [..] float;
-    array_resize(*breakdown_melody, samples.count);
-    defer array_free(breakdown_melody);
-    for 0..breakdown_melody.count - 1 breakdown_melody[it] = 0.0;
-
-    add_breakdown_melody(breakdown_melody, bpm, bars, first_bar = BREAKDOWN_START_BAR);
     apply_repeating_low_pass_sweep(breakdown_melody, bpm);
     apply_reverb_to_melody(samples, breakdown_melody);
 
-    breakdown_sparks: [..] float;
-    array_resize(*breakdown_sparks, samples.count);
-    defer array_free(breakdown_sparks);
-    for 0..breakdown_sparks.count - 1 breakdown_sparks[it] = 0.0;
-
-    add_breakdown_sparks(breakdown_sparks, bpm, bars);
     apply_reverb_to_signal(samples, breakdown_sparks, dry_gain = 0.18, wet_gain = 1.35);
 
-    melody: [..] float;
-    array_resize(*melody, samples.count);
-    defer array_free(melody);
-    for 0..melody.count - 1 melody[it] = 0.0;
+    apply_repeating_low_pass_sweep(intro_melody, bpm);
+    apply_reverb_to_melody(samples, intro_melody);
 
-    add_default_sine_melody(melody, bpm, bars, first_bar = INTRO_START_BAR);
-    apply_repeating_low_pass_sweep(melody, bpm);
-    apply_reverb_to_melody(samples, melody);
-
-    add_synth(samples, bpm, bars);
-    add_bass(samples, bpm, bars);
+    for i: 0..samples.count - 1 samples[i] += dry_synth[i] * 1.18;
+    apply_reverb_to_signal(samples, reverbed_synth, dry_gain = 0.86, wet_gain = 0.58);
+    for i: 0..samples.count - 1 samples[i] += bass[i] * 0.88;
 
     normalize(samples, 0.95);
     return samples;
-}
-
-mute_from_bar :: (samples: [] float, bpm: int, first_muted_bar: int) {
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    samples_per_bar := cast(int) (4.0 * seconds_per_beat * cast(float) SAMPLE_RATE_HZ + 0.5);
-    if samples_per_bar < 1 return;
-
-    first_muted_sample := first_muted_bar * samples_per_bar;
-    for i: 0..samples.count - 1 {
-        if i >= first_muted_sample samples[i] = 0.0;
-    }
 }
 
 hihat_fill_beat_for_bar :: (bar_index: int) -> int {
@@ -336,234 +488,376 @@ apply_repeating_low_pass_sweep :: (samples: [] float, bpm: int) {
     }
 }
 
-add_default_sine_melody :: (samples: [] float, bpm: int, bars: int, first_bar: int) {
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    seconds_per_sixteenth := seconds_per_beat / 4.0;
-    sixteenths_per_bar := 16;
-    total_sixteenths := bars * sixteenths_per_bar;
+// these don't have to be functions
 
-    phrase_start_bar := first_bar;
-    while phrase_start_bar < bars {
-        phrase_start_step := phrase_start_bar * sixteenths_per_bar;
+// 16 bars
 
-        add_melody_step(samples, phrase_start_step + 0,  7,       4, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 4,  7,       4, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 12, 0 + 12,  2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 14, 2 + 12,  2, seconds_per_sixteenth, total_sixteenths);
-
-        add_melody_step(samples, phrase_start_step + 16, 3 + 12,  2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 18, 2 + 12,  2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 28, 3,       2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 30, 2,       2, seconds_per_sixteenth, total_sixteenths);
-
-        add_melody_step(samples, phrase_start_step + 32, 3,       2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 34, 2,       2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 44, 10,      2, seconds_per_sixteenth, total_sixteenths);
-        add_melody_step(samples, phrase_start_step + 46, 7,       2, seconds_per_sixteenth, total_sixteenths);
-
-        phrase_start_bar += 4;
-    }
+synth_pulse_pattern_notation :: () -> string {
+    notation := #string END
+[ 0 0 - 0 ] [ - 0 0 0 ] [ 0 0 - 0 ] [ - 0 0 0 ]
+[ 8, 8, - 8, ] [ - 8, 8, 8, ] [ 8, 8, - 8, ] [ - 8, 8, 8, ]
+[ 3, 3, - 3, ] [ - 3, 3, 3, ] [ 3, 3, - 3, ] [ - 3, 3, 3, ]
+[ 7, 7, - 7, ] [ - 7, 7, 7, ] [ 7, 7, - 7, ] [ - 7, 7, 7, ]
+END
+    return notation;
 }
 
-add_synth :: (mix: [] float, bpm: int, bars: int) {
-    dry_synth: [..] float;
-    array_resize(*dry_synth, mix.count);
-    defer array_free(dry_synth);
-    for 0..dry_synth.count - 1 dry_synth[it] = 0.0;
+// 16 bars
 
-    reverbed_synth: [..] float;
-    array_resize(*reverbed_synth, mix.count);
-    defer array_free(reverbed_synth);
-    for 0..reverbed_synth.count - 1 reverbed_synth[it] = 0.0;
+synth_pattern_notation :: () -> string {
+    notation := #string END
+[ 0 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ 2 ~ 3 ~ ]
+[ 8 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ 8 ~ 10 ~ ]
+[ 3 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ 3 ~ 5 ~ ]
+[ 2 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
+END
+    return notation;
+}
 
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    seconds_per_sixteenth := seconds_per_beat / 4.0;
-    sixteenths_per_bar := 16;
-    total_sixteenths := bars * sixteenths_per_bar;
+// 32 bars
 
-    pulse_first_step := GROOVE_START_BAR * sixteenths_per_bar;
-    pulse_last_step := min(total_sixteenths, pulse_first_step + GROOVE_SECTION_BARS * sixteenths_per_bar);
+intro_melody_phrase_notation :: () -> string {
+    notation := #string END
+[ 0 7, 2 7, ] [ 3 7, 5 7, ] [ 3 7, 0 7, ] [ 2 7, 7, 7, ] 
+[ 3 10, 5 10, ] [ 7 10, 8 10,] [ 7 10, 3 10, ] [ 5 10, 10, 10,]
+[ 7 2 8 2 ] [ 10 2 0' 2 ] [ 10 2 7 2 ] [ 8 2 2 2 ] 
+[ 10 5 0' 5 ] [ 2' 5 3' 5 ] [ 2' 5 10 5 ] [ 0' 5 5 5 ]
+[ 0' 7 2' 7 ] [ 3' 7 5' 7 ] [ 3' 7 0' 7 ] [ 2' 7 7 7 ]
+[ 8 3 10 3 ] [ 0' 3 2' 3 ] [ 0' 3 8 3 ] [ 10 3 3 3 ]
+[ 5 0 7 0 ] [ 8 0 10 0 ] [ 8 0 5 0 ] [ 7 0 0 0 ] 
+[ 2 10, 3 10, ] [ 5 10, 7 10, ] [ 5 10, 2 10, ] [ 3 10,  10, ]
+END
+    return notation;
+}
 
-    for step: pulse_first_step..pulse_last_step - 1 {
-        pattern_step := (step - pulse_first_step) % sixteenths_per_bar;
-        if !synth_pulse_pattern_is_on(pattern_step) continue;
+// 16 bars
 
-        bar_offset := (step / sixteenths_per_bar) - GROOVE_START_BAR;
-        relative_note := synth_pulse_relative_note_for_bar(bar_offset);
-        semitones_from_c4 := MELODY_ANCHOR + relative_note;
-        start_seconds := cast(float) step * seconds_per_sixteenth;
-        duration_seconds := seconds_per_sixteenth * 0.78;
-        add_sine_synth_note(dry_synth, start_seconds, duration_seconds, semitones_from_c4, 0.26);
-    }
+later_melody_phrase_notation :: () -> string {
+    notation := #string END
+[ 7 ~ ~ ~ ] [ 7 ~ ~ ~ ] [ - - - - ] [ 0' ~ 2' ~ ]
+[ 3' ~ 2' ~ ] [ - - - - ] [ - - - - ] [ 3 ~ 2 ~ ]
+[ 3 ~ 2 ~ ] [ - - - - ] [ - - - - ] [ 10 ~ 7 ~ ]
+[ - - - - ] [ - - - - ] [ - - - - ] [ - - - - ]
+END
+    return notation;
+}
 
-    pattern_first_step := SYNTH_PATTERN_START_BAR * sixteenths_per_bar;
-    pattern_last_step := min(total_sixteenths, pattern_first_step + 16 * sixteenths_per_bar);
-    events := synth_pattern_events();
+// 16 bars
 
-    for repeat: 0..3 {
-        repeat_step := pattern_first_step + repeat * 4 * sixteenths_per_bar;
-        if repeat_step >= pattern_last_step break;
+bass_pattern_notation :: () -> string {
+    notation := #string END
+[ 8,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
+[ 5,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
+[ 0,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
+[ 10,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
+END
+    return notation;
+}
 
-        for events {
-            step := repeat_step + it.step_offset;
-            if step >= pattern_last_step break;
+// 32 bars
 
-            start_seconds := cast(float) step * seconds_per_sixteenth;
-            duration_seconds := seconds_per_sixteenth * 1.85;
-            semitones_from_c4 := MELODY_ANCHOR + it.relative_note;
-            add_sine_synth_note(reverbed_synth, start_seconds, duration_seconds, semitones_from_c4, 0.20);
+breakdown_melody_notation :: () -> string {
+    notation := #string END
+0' 7   2'  3' 
+8  ~   3'  5'
+7' 10  7'  8'
+(5' 10) ~ ~ ~
+
+0' 10   2'  3' 
+8  ~   3'  5'
+7' 3  7'  8'
+(5' 2) ~ ~ ~
+
+END
+    return notation;
+}
+
+parse_note_pattern :: (notation: string, duration_mode: Note_Duration_Mode, duration_sixteenths: float) -> [..] Note_Event {
+    events: [..] Note_Event;
+    current_sixteenth := 0;
+    cursor := 0;
+    inside_beat := false;
+
+    while cursor < notation.count {
+        c := notation[cursor];
+
+        if c == #char "[" {
+            inside_beat = true;
+            cursor += 1;
+            continue;
         }
+
+        if c == #char "]" {
+            inside_beat = false;
+            cursor += 1;
+            continue;
+        }
+
+        if is_note_notation_separator(c) {
+            cursor += 1;
+            continue;
+        }
+
+        token_sixteenths := ifx inside_beat then 1 else 4;
+
+        if c == #char "-" {
+            if duration_mode == .UNTIL_NEXT_NOTE {
+                array_add(*events, make_rest_event(current_sixteenth, duration_mode));
+            }
+            current_sixteenth += token_sixteenths;
+            cursor += 1;
+            continue;
+        }
+
+        if c == #char "~" {
+            current_sixteenth += token_sixteenths;
+            cursor += 1;
+            continue;
+        }
+
+        if c == #char "(" {
+            event := make_note_event(current_sixteenth, duration_mode, duration_sixteenths);
+            cursor += 1;
+
+            while cursor < notation.count {
+                if notation[cursor] == #char ")" {
+                    cursor += 1;
+                    break;
+                }
+
+                if is_note_notation_separator(notation[cursor]) {
+                    cursor += 1;
+                    continue;
+                }
+
+                if notation[cursor] >= #char "0" && notation[cursor] <= #char "9" {
+                    if event.note_count < NOTE_EVENT_MAX_NOTES {
+                        event.relative_notes[event.note_count] = parse_relative_note(notation, *cursor);
+                        event.note_count += 1;
+                    } else {
+                        parse_relative_note(notation, *cursor);
+                    }
+                    continue;
+                }
+
+                cursor += 1;
+            }
+
+            if event.note_count > 0 array_add(*events, event);
+            current_sixteenth += token_sixteenths;
+            continue;
+        }
+
+        if c >= #char "0" && c <= #char "9" {
+            event := make_note_event(current_sixteenth, duration_mode, duration_sixteenths);
+            event.relative_notes[0] = parse_relative_note(notation, *cursor);
+            event.note_count = 1;
+            array_add(*events, event);
+            current_sixteenth += token_sixteenths;
+            continue;
+        }
+
+        cursor += 1;
     }
 
-    for i: 0..mix.count - 1 mix[i] += dry_synth[i] * 1.18;
-    apply_reverb_to_signal(mix, reverbed_synth, dry_gain = 0.86, wet_gain = 0.58);
+    return events;
 }
 
-synth_pulse_pattern_is_on :: (step_in_bar: int) -> bool {
-    // |00x0|x000|00x0|x000| where 0 = note on, x = rest.
-    if step_in_bar == 0  return true;
-    if step_in_bar == 1  return true;
-    if step_in_bar == 3  return true;
-    if step_in_bar == 6  return true;
-    if step_in_bar == 7  return true;
-    if step_in_bar == 8  return true;
-    if step_in_bar == 9  return true;
-    if step_in_bar == 11 return true;
-    if step_in_bar == 14 return true;
-    if step_in_bar == 15 return true;
+make_rest_event :: (sixteenth_offset: int, duration_mode: Note_Duration_Mode) -> Note_Event {
+    event: Note_Event;
+    event.sixteenth_offset = sixteenth_offset;
+    event.kind = .REST;
+    event.duration_mode = duration_mode;
+    return event;
+}
+
+make_note_event :: (sixteenth_offset: int, duration_mode: Note_Duration_Mode, duration_sixteenths: float) -> Note_Event {
+    event: Note_Event;
+    event.sixteenth_offset = sixteenth_offset;
+    event.kind = .NOTE;
+    event.duration_mode = duration_mode;
+    event.duration_sixteenths = duration_sixteenths;
+    return event;
+}
+
+parse_relative_note :: (notation: string, cursor: *int) -> int {
+    relative_note := 0;
+
+    while cursor.* < notation.count && notation[cursor.*] >= #char "0" && notation[cursor.*] <= #char "9" {
+        relative_note = relative_note * 10 + cast(int) (notation[cursor.*] - #char "0");
+        cursor.* += 1;
+    }
+
+    while cursor.* < notation.count {
+        if notation[cursor.*] == #char "," {
+            relative_note -= 12;
+            cursor.* += 1;
+            continue;
+        }
+
+        if notation[cursor.*] == #char "'" {
+            relative_note += 12;
+            cursor.* += 1;
+            continue;
+        }
+
+        break;
+    }
+
+    return relative_note;
+}
+
+count_note_pattern_sixteenths :: (notation: string) -> int {
+    sixteenth_count := 0;
+    cursor := 0;
+    inside_beat := false;
+
+    while cursor < notation.count {
+        c := notation[cursor];
+
+        if c == #char "[" {
+            inside_beat = true;
+            cursor += 1;
+            continue;
+        }
+
+        if c == #char "]" {
+            inside_beat = false;
+            cursor += 1;
+            continue;
+        }
+
+        if is_note_notation_separator(c) {
+            cursor += 1;
+            continue;
+        }
+
+        token_sixteenths := ifx inside_beat then 1 else 4;
+
+        if c == #char "-" || c == #char "~" {
+            sixteenth_count += token_sixteenths;
+            cursor += 1;
+            continue;
+        }
+
+        if c == #char "(" {
+            cursor += 1;
+            while cursor < notation.count {
+                if notation[cursor] == #char ")" {
+                    cursor += 1;
+                    break;
+                }
+
+                if notation[cursor] >= #char "0" && notation[cursor] <= #char "9" {
+                    parse_relative_note(notation, *cursor);
+                    continue;
+                }
+
+                cursor += 1;
+            }
+
+            sixteenth_count += token_sixteenths;
+            continue;
+        }
+
+        if c >= #char "0" && c <= #char "9" {
+            parse_relative_note(notation, *cursor);
+            sixteenth_count += token_sixteenths;
+            continue;
+        }
+
+        cursor += 1;
+    }
+
+    return sixteenth_count;
+}
+
+is_note_notation_separator :: (c: u8) -> bool {
+    if c == #char " "  return true;
+    if c == #char "\t" return true;
+    if c == #char "\n" return true;
+    if c == #char "\r" return true;
     return false;
 }
 
-synth_pulse_relative_note_for_bar :: (bar_offset: int) -> int {
-    note_index := bar_offset % 4;
-    if note_index == 0 return 0;
-    if note_index == 1 return 8 - 12;
-    if note_index == 2 return 3 - 12;
-    return 7 - 12;
-}
+add_matching_note_event :: (
+    samples: [] float,
+    events: [] Note_Event,
+    phrase_sixteenth_index: int,
+    current_sixteenth: int,
+    phrase_length_sixteenths: int,
+    seconds_per_sixteenth: float,
+    total_sixteenths: int,
+    amp: float
+) {
+    for event_index: 0..events.count - 1 {
+        event := events[event_index];
+        if phrase_sixteenth_index != event.sixteenth_offset continue;
+        if event.kind != .NOTE return;
 
-add_bass :: (mix: [] float, bpm: int, bars: int) {
-    bass: [..] float;
-    array_resize(*bass, mix.count);
-    defer array_free(bass);
-    for 0..bass.count - 1 bass[it] = 0.0;
+        duration_sixteenths := note_event_duration_sixteenths(events, event_index, phrase_length_sixteenths);
+        remaining_sixteenths := total_sixteenths - current_sixteenth;
+        if duration_sixteenths > cast(float) remaining_sixteenths duration_sixteenths = cast(float) remaining_sixteenths;
 
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    seconds_per_sixteenth := seconds_per_beat / 4.0;
-    sixteenths_per_bar := 16;
-    total_sixteenths := bars * sixteenths_per_bar;
-    first_step := BASS_START_BAR * sixteenths_per_bar;
-    last_step := min(total_sixteenths, INTRO_START_BAR * sixteenths_per_bar);
-    notes := bass_pattern_notes();
-
-    repeat := 0;
-    while true {
-        repeat_step := first_step + repeat * 4 * sixteenths_per_bar;
-        if repeat_step >= last_step break;
-
-        for i: 0..notes.count - 1 {
-            step := repeat_step + i * sixteenths_per_bar;
-            if step >= last_step break;
-
-            start_seconds := cast(float) step * seconds_per_sixteenth;
-            duration_seconds := seconds_per_sixteenth * 15.5;
-            semitones_from_c4 := MELODY_ANCHOR + notes[i] - 24;
-            add_bass_synth_note(bass, start_seconds, duration_seconds, semitones_from_c4, 0.34);
-        }
-
-        repeat += 1;
-    }
-
-    for i: 0..mix.count - 1 mix[i] += bass[i] * 0.88;
-}
-
-add_breakdown_melody :: (samples: [] float, bpm: int, bars: int, first_bar: int) {
-    if first_bar >= bars return;
-
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    seconds_per_sixteenth := seconds_per_beat / 4.0;
-    sixteenths_per_bar := 16;
-    total_sixteenths := bars * sixteenths_per_bar;
-    first_step := first_bar * sixteenths_per_bar;
-    notes := breakdown_melody_notes();
-
-    for repeat: 0..1 {
-        repeat_start_step := first_step + repeat * notes.count * 4;
-        for i: 0..notes.count - 1 {
-            step := repeat_start_step + i * 4;
-            if step >= total_sixteenths return;
-            add_melody_step(samples, step, notes[i], 4, seconds_per_sixteenth, total_sixteenths);
+        start_seconds := cast(float) current_sixteenth * seconds_per_sixteenth;
+        duration_seconds := duration_sixteenths * seconds_per_sixteenth;
+        chord_gain := amp / sqrt(cast(float) max(1, event.note_count));
+        for note_index: 0..event.note_count - 1 {
+            semitones_from_c4 := MELODY_ANCHOR + event.relative_notes[note_index];
+            add_sine_synth_note(samples, start_seconds, duration_seconds, semitones_from_c4, chord_gain);
         }
     }
+}
 
-    first_half_start_sample := cast(int) floor(cast(float) first_step * seconds_per_sixteenth * cast(float) SAMPLE_RATE_HZ);
-    first_half_samples := cast(int) floor(8.0 * 4.0 * seconds_per_beat * cast(float) SAMPLE_RATE_HZ);
-    second_half_start_sample := first_half_start_sample + first_half_samples;
+add_matching_bass_event :: (
+    samples: [] float,
+    events: [] Note_Event,
+    phrase_sixteenth_index: int,
+    current_sixteenth: int,
+    phrase_length_sixteenths: int,
+    seconds_per_sixteenth: float,
+    total_sixteenths: int,
+    amp: float
+) {
+    for event_index: 0..events.count - 1 {
+        event := events[event_index];
+        if phrase_sixteenth_index != event.sixteenth_offset continue;
+        if event.kind != .NOTE return;
 
-    for i: 0..first_half_samples - 1 {
-        destination := second_half_start_sample + i;
-        source := first_half_start_sample + first_half_samples - 1 - i;
-        if destination >= samples.count || source >= samples.count break;
-        samples[destination] = samples[source];
+        duration_sixteenths := note_event_duration_sixteenths(events, event_index, phrase_length_sixteenths);
+        remaining_sixteenths := total_sixteenths - current_sixteenth;
+        if duration_sixteenths > cast(float) remaining_sixteenths duration_sixteenths = cast(float) remaining_sixteenths;
+
+        start_seconds := cast(float) current_sixteenth * seconds_per_sixteenth;
+        duration_seconds := duration_sixteenths * seconds_per_sixteenth;
+        chord_gain := amp / sqrt(cast(float) max(1, event.note_count));
+        for note_index: 0..event.note_count - 1 {
+            semitones_from_c4 := MELODY_ANCHOR + event.relative_notes[note_index];
+            add_bass_synth_note(samples, start_seconds, duration_seconds, semitones_from_c4, chord_gain);
+        }
     }
 }
 
-add_breakdown_sparks :: (samples: [] float, bpm: int, bars: int) {
-    start_bar := INTRO_START_BAR - 4;
-    if start_bar < BREAKDOWN_START_BAR start_bar = BREAKDOWN_START_BAR;
-    if start_bar >= bars return;
+note_event_duration_sixteenths :: (events: [] Note_Event, event_index: int, phrase_length_sixteenths: int) -> float {
+    event := events[event_index];
+    if event.duration_mode == .FIXED return event.duration_sixteenths;
 
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    first_step := start_bar * 16;
-    total_sixteenths := bars * 16;
-    last_step := min(total_sixteenths, INTRO_START_BAR * 16);
-
-    spark_noise: Noise_State;
-    spark_noise.value = 0x62F3A91D;
-
-    step := first_step;
-    while step < last_step {
-        start_seconds := cast(float) step * seconds_per_beat / 4.0;
-        add_spark(samples, start_seconds, 0.54, *spark_noise);
-        step += 4;
+    next_sixteenth_offset := phrase_length_sixteenths;
+    for i: 0..events.count - 1 {
+        if events[i].sixteenth_offset <= event.sixteenth_offset continue;
+        if events[i].sixteenth_offset < next_sixteenth_offset next_sixteenth_offset = events[i].sixteenth_offset;
     }
+
+    return cast(float) (next_sixteenth_offset - event.sixteenth_offset);
 }
 
-synth_pattern_events :: () -> [] Melody_Event {
-    return .[
-        .{0, 0},
-        .{12, 2},
-        .{14, 3},
-        .{16, 8},
-        .{28, 8},
-        .{30, 10},
-        .{32, 3},
-        .{44, 3},
-        .{46, 5},
-        .{48, 2},
-    ];
-}
+add_melody_step :: (samples: [] float, start_sixteenth: int, relative_note: int, duration_sixteenths: int, seconds_per_sixteenth: float, total_sixteenths: int) {
+    if start_sixteenth >= total_sixteenths return;
 
-bass_pattern_notes :: () -> [] int {
-    return .[8, 5, 0, 10];
-}
-
-breakdown_melody_notes :: () -> [] int {
-    return .[
-        7,  0 + 12, 2 + 12, 3 + 12,
-        8,  0 + 12, 2 + 12, 5 + 12,
-        10, 0 + 12, 3 + 12, 7 + 12,
-        5 + 12, 3 + 12, 2 + 12, 3 + 12,
-    ];
-}
-
-add_melody_step :: (samples: [] float, step: int, relative_note: int, duration_steps: int, seconds_per_sixteenth: float, total_sixteenths: int) {
-    if step >= total_sixteenths return;
-
-    remaining_steps := total_sixteenths - step;
-    actual_duration_steps := min(duration_steps, remaining_steps);
-    start_seconds := cast(float) step * seconds_per_sixteenth;
-    duration_seconds := cast(float) actual_duration_steps * seconds_per_sixteenth * 0.96;
+    remaining_sixteenths := total_sixteenths - start_sixteenth;
+    actual_duration_sixteenths := min(duration_sixteenths, remaining_sixteenths);
+    start_seconds := cast(float) start_sixteenth * seconds_per_sixteenth;
+    duration_seconds := cast(float) actual_duration_sixteenths * seconds_per_sixteenth * 0.96;
     semitones_from_c4 := MELODY_ANCHOR + relative_note;
     add_sine_synth_note(samples, start_seconds, duration_seconds, semitones_from_c4, 0.23);
 }
