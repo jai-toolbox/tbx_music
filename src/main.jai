@@ -1,5 +1,3 @@
-MELODY_ANCHOR :: 5;
-BREAKDOWN_LOW_PASS_HZ :: 800.0;
 NOTE_EVENT_MAX_NOTES :: 8;
 
 Note_Duration_Mode :: enum {
@@ -22,9 +20,9 @@ Note_Event :: struct {
 }
 
 Render_Config :: struct {
-    bpm: int = 135;
-    bars: int = 70;
-    output_path: string = "out/song.wav";
+    bpm: int = 134;
+    bars: int = 8;
+    output_path: string = "out/song_two.wav";
 }
 
 Noise_State :: struct {
@@ -32,11 +30,23 @@ Noise_State :: struct {
 }
 
 main :: () {
-    if maybe_run_reverb_oracle() return;
-    if maybe_run_low_pass_oracle() return;
-    if maybe_run_debug_sine() return;
-    if maybe_run_debug_synth_events() return;
-    if maybe_run_debug_synth_pulse() return;
+    render_song_from_command_line();
+}
+
+maybe_run_debug_or_oracle_command :: () -> bool {
+    if maybe_run_reverb_oracle() return true;
+    if maybe_run_low_pass_oracle() return true;
+    if maybe_run_variable_delay_oracle() return true;
+    if maybe_run_pan2_oracle() return true;
+    if maybe_run_debug_sine() return true;
+    if maybe_run_debug_synth_events() return true;
+    if maybe_run_debug_synth_pulse() return true;
+
+    return false;
+}
+
+render_song_from_command_line :: () {
+    if maybe_run_debug_or_oracle_command() return;
 
     config := parse_args();
 
@@ -45,17 +55,20 @@ main :: () {
     if config.bars < 1   config.bars = 1;
     if config.bars > 64  config.bars = 64;
 
-    samples := render_song(config.bpm, config.bars);
+    samples := render_song_two(config.bpm, config.bars);
     defer array_free(samples);
 
-    success := write_wav_16_mono(config.output_path, samples);
+    apply_constant_low_pass_stereo(samples, 3600.0);
+    apply_reverb_to_stereo_signal(samples, dry_gain = 0.92, wet_gain = 0.34);
+
+    success := write_wav_16_stereo(config.output_path, samples);
     if !success {
         print("Failed to write %\n", config.output_path);
         return;
     }
 
     seconds := cast(float) samples.count / cast(float) SAMPLE_RATE_HZ;
-    print("Wrote % (% bpm, % bars, % samples, % seconds)\n", config.output_path, config.bpm, config.bars, samples.count, seconds);
+    print("Wrote % (% bpm, % bars, % frames, % seconds)\n", config.output_path, config.bpm, config.bars, samples.count, seconds);
     print("Try: aplay %\n", config.output_path);
 }
 
@@ -217,6 +230,91 @@ maybe_run_low_pass_oracle :: () -> bool {
     return true;
 }
 
+maybe_run_variable_delay_oracle :: () -> bool {
+    args := get_command_line_arguments();
+    defer array_reset(*args);
+
+    if args.count < 2 return false;
+    if args[1] != "--variable-delay-oracle" return false;
+
+    output_path := "oracle/jai_vdelay.raw";
+    sample_count := SAMPLE_RATE_HZ * 3;
+
+    if args.count >= 3 output_path = args[2];
+    if args.count >= 4 {
+        value, ok, _ := string_to_int(args[3]);
+        if ok sample_count = value;
+    }
+
+    samples: [..] float;
+    array_resize(*samples, sample_count);
+    defer array_free(samples);
+
+    delay: Variable_Delay;
+    variable_delay_init(*delay, cast(float) SAMPLE_RATE_HZ, 0.021);
+    defer variable_delay_free(*delay);
+    delay.feedback = 0.31;
+
+    for i: 0..sample_count - 1 {
+        delay.delay_seconds = variable_delay_oracle_delay(i);
+        samples[i] = variable_delay_process(*delay, variable_delay_oracle_input(i));
+    }
+
+    directory := path_strip_filename(output_path);
+    if directory.count > 0 make_directory_if_it_does_not_exist(directory, recursive = true);
+
+    ok := write_entire_file(output_path, samples.data, samples.count * size_of(float));
+    if !ok {
+        print("Failed to write oracle output: %\n", output_path);
+    } else {
+        print("Wrote Jai variable-delay oracle output: % (% samples)\n", output_path, sample_count);
+    }
+
+    return true;
+}
+
+maybe_run_pan2_oracle :: () -> bool {
+    args := get_command_line_arguments();
+    defer array_reset(*args);
+
+    if args.count < 2 return false;
+    if args[1] != "--pan2-oracle" return false;
+
+    output_path := "oracle/jai_pan2.raw";
+    sample_count := SAMPLE_RATE_HZ;
+
+    if args.count >= 3 output_path = args[2];
+    if args.count >= 4 {
+        value, ok, _ := string_to_int(args[3]);
+        if ok sample_count = value;
+    }
+
+    samples: [..] Stereo_Sample;
+    array_resize(*samples, sample_count);
+    defer array_free(samples);
+
+    pan: Pan_2;
+    pan2_init(*pan);
+
+    for i: 0..sample_count - 1 {
+        pan.pan = pan2_oracle_pan(i);
+        pan.mode = pan2_oracle_mode(i);
+        samples[i] = pan2_process(*pan, pan2_oracle_input(i));
+    }
+
+    directory := path_strip_filename(output_path);
+    if directory.count > 0 make_directory_if_it_does_not_exist(directory, recursive = true);
+
+    ok := write_entire_file(output_path, samples.data, samples.count * size_of(Stereo_Sample));
+    if !ok {
+        print("Failed to write oracle output: %\n", output_path);
+    } else {
+        print("Wrote Jai pan2 oracle output: % (% frames)\n", output_path, sample_count);
+    }
+
+    return true;
+}
+
 reverb_oracle_input :: (sample_index: int) -> float {
     t := cast(float) sample_index / cast(float) SAMPLE_RATE_HZ;
     env := ifx sample_index < 12000 then 1.0 else 0.0;
@@ -234,6 +332,36 @@ low_pass_oracle_input :: (sample_index: int) -> float {
 low_pass_oracle_cutoff :: (sample_index: int, sample_count: int) -> float {
     progress := cast(float) sample_index / cast(float) max(1, sample_count - 1);
     return linear_interpolate(12000.0, 650.0, progress);
+}
+
+variable_delay_oracle_input :: (sample_index: int) -> float {
+    if sample_index == 0 return 1.0;
+    if sample_index == 307 return 0.5;
+    if sample_index == 1024 return -0.45;
+    if (sample_index % 997) == 0 return -0.35;
+    if (sample_index % 211) == 0 return 0.12;
+    return 0.0;
+}
+
+variable_delay_oracle_delay :: (sample_index: int) -> float {
+    segment := sample_index % 5000;
+    progress := cast(float) segment / 4999.0;
+    return linear_interpolate(0.003, 0.017, progress);
+}
+
+pan2_oracle_input :: (sample_index: int) -> float {
+    segment := sample_index % 251;
+    return (cast(float) segment - 125.0) / 125.0;
+}
+
+pan2_oracle_pan :: (sample_index: int) -> float {
+    segment := sample_index % 4096;
+    progress := cast(float) segment / 4095.0;
+    return linear_interpolate(-1.0, 1.0, progress);
+}
+
+pan2_oracle_mode :: (sample_index: int) -> int {
+    return (sample_index / 4096) % 4;
 }
 
 parse_args :: () -> Render_Config {
@@ -279,316 +407,27 @@ parse_args :: () -> Render_Config {
 
 print_usage :: () {
     print("tbx_music: synthesize a small kick + snare + hihat + sine synth beat to WAV.\n");
-    print("Usage: bin/tbx_music [--bpm 135] [--bars 47] [--out out/song.wav]\n");
+    print("Usage: bin/tbx_music [--bpm 135] [--bars 47] [--out out/song_two.wav]\n");
     print("       bin/tbx_music --debug-sine [out/sine.wav]\n");
-}
-
-render_song :: (bpm: int, bars: int) -> [..] float {
-
-    beats_per_bar := 4;
-    sixteenths_per_bar := 16;
-    total_sixteenths := bars * sixteenths_per_bar;
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    seconds_per_sixteenth := seconds_per_beat / 4.0;
-    tail_seconds := 0.55;
-    total_seconds := cast(float) bars * cast(float) beats_per_bar * seconds_per_beat + tail_seconds;
-    total_samples := cast(int) ceil(total_seconds * cast(float) SAMPLE_RATE_HZ);
-
-    samples: [..] float;
-    array_resize(*samples, total_samples);
-    for 0..samples.count - 1 samples[it] = 0.0;
-
-    noise: Noise_State;
-    hihat: [..] float;
-    array_resize(*hihat, total_samples);
-    defer array_free(hihat);
-    for 0..hihat.count - 1 hihat[it] = 0.0;
-
-    breakdown_drums: [..] float;
-    array_resize(*breakdown_drums, total_samples);
-    defer array_free(breakdown_drums);
-    for 0..breakdown_drums.count - 1 breakdown_drums[it] = 0.0;
-
-    breakdown_melody: [..] float;
-    array_resize(*breakdown_melody, total_samples);
-    defer array_free(breakdown_melody);
-    for 0..breakdown_melody.count - 1 breakdown_melody[it] = 0.0;
-
-    breakdown_sparks: [..] float;
-    array_resize(*breakdown_sparks, total_samples);
-    defer array_free(breakdown_sparks);
-    for 0..breakdown_sparks.count - 1 breakdown_sparks[it] = 0.0;
-
-    intro_melody: [..] float;
-    array_resize(*intro_melody, total_samples);
-    defer array_free(intro_melody);
-    for 0..intro_melody.count - 1 intro_melody[it] = 0.0;
-
-    dry_synth: [..] float;
-    array_resize(*dry_synth, total_samples);
-    defer array_free(dry_synth);
-    for 0..dry_synth.count - 1 dry_synth[it] = 0.0;
-
-    reverbed_synth: [..] float;
-    array_resize(*reverbed_synth, total_samples);
-    defer array_free(reverbed_synth);
-    for 0..reverbed_synth.count - 1 reverbed_synth[it] = 0.0;
-
-    bass: [..] float;
-    array_resize(*bass, total_samples);
-    defer array_free(bass);
-    for 0..bass.count - 1 bass[it] = 0.0;
-
-    spark_noise: Noise_State;
-    spark_noise.value = 0x62F3A91D;
-
-    synth_events := parse_note_pattern(synth_pattern_notation(), .UNTIL_NEXT_NOTE, 0.0);
-    defer array_free(synth_events);
-    intro_melody_events := parse_note_pattern(intro_melody_phrase_notation(), .UNTIL_NEXT_NOTE, 0.0);
-    defer array_free(intro_melody_events);
-    synth_pulse_events := parse_note_pattern(synth_pulse_pattern_notation(), .FIXED, 0.78);
-    defer array_free(synth_pulse_events);
-    synth_pulse_phrase_sixteenths := count_note_pattern_sixteenths(synth_pulse_pattern_notation());
-    bass_events := parse_note_pattern(bass_pattern_notation(), .FIXED, 15.5);
-    defer array_free(bass_events);
-    bass_phrase_sixteenths := count_note_pattern_sixteenths(bass_pattern_notation());
-    breakdown_melody_events := parse_note_pattern(breakdown_melody_notation(), .FIXED, 3.84);
-    defer array_free(breakdown_melody_events);
-    breakdown_melody_phrase_sixteenths := count_note_pattern_sixteenths(breakdown_melody_notation());
-
-    for current_sixteenth: 0..total_sixteenths - 1 {
-
-        current_seconds := cast(float) current_sixteenth * seconds_per_sixteenth;
-        beat_index_in_bar := (current_sixteenth / 4) % 4;
-        sixteenth_index_in_beat := current_sixteenth % 4;
-        bar_index := current_sixteenth / sixteenths_per_bar;
-        sixteenth_index_in_bar := current_sixteenth % sixteenths_per_bar;
-
-        // sixteenth-note hihat, with occasional 32nd-note fills on one beat of the bar.
-        if !(bar_index >= 24 && bar_index <= 39 || bar_index >= 63) {
-            amp := ifx sixteenth_index_in_beat == 0 then 0.24 else 0.16;
-            fill_beat := hihat_fill_beat_for_bar(bar_index);
-            if beat_index_in_bar == fill_beat {
-                if beat_index_in_bar % 3 == 0 {
-                    add_hihat(hihat, current_seconds, 0.013, amp * 0.88, *noise);
-                    add_hihat(hihat, current_seconds + seconds_per_sixteenth * 0.25, 0.016, amp * 0.74, *noise);
-                    add_hihat(hihat, current_seconds + 2 * seconds_per_sixteenth * 0.25, 0.016, amp * 0.74, *noise);
-                    add_hihat(hihat, current_seconds + 3 * seconds_per_sixteenth * 0.25, 0.016, amp * 0.74, *noise);
-                } else {
-                    add_hihat(hihat, current_seconds, 0.026, amp * 0.88, *noise);
-                    add_hihat(hihat, current_seconds + seconds_per_sixteenth * 0.5, 0.026, amp * 0.74, *noise);
-                }
-            } else {
-                add_hihat(hihat, current_seconds, 0.045, amp, *noise);
-            }
-        }
-
-        // bass drum on 1, 2&, and 3&.
-        if sixteenth_index_in_bar == 0 || sixteenth_index_in_bar == 6 || sixteenth_index_in_bar == 10 {
-            if bar_index >= 24 && bar_index <= 39 {
-                add_kick(breakdown_drums, current_seconds, 0.95);
-            } else {
-                add_kick(samples, current_seconds, 0.95);
-            }
-        }
-
-        // backbeat spark on beats 2 and 4.
-        if sixteenth_index_in_beat == 0 && (beat_index_in_bar == 1 || beat_index_in_bar == 3) {
-            if bar_index >= 24 && bar_index <= 39 {
-                add_spark(breakdown_drums, current_seconds, 0.85, *noise);
-            } else {
-                add_spark(samples, current_seconds, 0.85, *noise);
-            }
-        }
-
-        // bars 25-40: breakdown melody.
-        if bar_index >= 24 && bar_index <= 39 {
-            breakdown_sixteenth_index := (current_sixteenth - (25 - 1) * sixteenths_per_bar) % breakdown_melody_phrase_sixteenths;
-            add_matching_note_event(breakdown_melody, breakdown_melody_events, breakdown_sixteenth_index, current_sixteenth, breakdown_melody_phrase_sixteenths, seconds_per_sixteenth, total_sixteenths, 0.23);
-        }
-
-        // bars 37-40: extra bright hits into the end of the breakdown.
-        if bar_index >= 36 && bar_index <= 39 && sixteenth_index_in_beat == 0 {
-            add_spark(breakdown_sparks, current_seconds, 0.54, *spark_noise);
-        }
-
-        // bars 41+: hyper sixteenth sine melody, repeating every four bars.
-        if bar_index >= 40 && bar_index <= 47   {
-            phrase_sixteenth_index := (current_sixteenth - (41 - 1) * sixteenths_per_bar) % (4 * sixteenths_per_bar);
-            add_matching_note_event(intro_melody, intro_melody_events, phrase_sixteenth_index, current_sixteenth, 4 * sixteenths_per_bar, seconds_per_sixteenth, total_sixteenths, 0.23);
-        }
-
-        // bars 1-24: dry pulse synth over the groove.
-        if bar_index >= 0 && bar_index <= 23 {
-            synth_pulse_sixteenth_index := current_sixteenth % synth_pulse_phrase_sixteenths;
-            add_matching_note_event(dry_synth, synth_pulse_events, synth_pulse_sixteenth_index, current_sixteenth, synth_pulse_phrase_sixteenths, seconds_per_sixteenth, total_sixteenths, 0.26);
-        }
-
-        // bars 9-24: reverb synth pattern. do do do do 
-        if bar_index >= 8 && bar_index <= 23 || bar_index >= 48 && bar_index <= 63  {
-            pattern_sixteenth_index := (current_sixteenth - (9 - 1) * sixteenths_per_bar) % (4 * sixteenths_per_bar);
-            add_matching_note_event(reverbed_synth, synth_events, pattern_sixteenth_index, current_sixteenth, 4 * sixteenths_per_bar, seconds_per_sixteenth, total_sixteenths, 0.20);
-        }
-
-        // bars 17-40: bass notes begin later in the groove and continue through the breakdown.
-        if bar_index >= 16 && bar_index <= 39 || bar_index >= 48 {
-            bass_sixteenth_index := (current_sixteenth - (17 - 1) * sixteenths_per_bar) % bass_phrase_sixteenths;
-            add_matching_bass_event(bass, bass_events, bass_sixteenth_index, current_sixteenth, bass_phrase_sixteenths, seconds_per_sixteenth, total_sixteenths, 0.34);
-        }
-    }
-
-    apply_repeating_low_pass_sweep(hihat, bpm);
-    apply_constant_low_pass(breakdown_drums, BREAKDOWN_LOW_PASS_HZ);
-    for i: 0..samples.count - 1 samples[i] += hihat[i];
-    for i: 0..samples.count - 1 samples[i] += breakdown_drums[i];
-
-    apply_repeating_low_pass_sweep(breakdown_melody, bpm);
-    apply_reverb_to_melody(samples, breakdown_melody);
-
-    apply_reverb_to_signal(samples, breakdown_sparks, dry_gain = 0.18, wet_gain = 1.35);
-
-    apply_repeating_low_pass_sweep(intro_melody, bpm);
-    apply_reverb_to_melody(samples, intro_melody);
-
-    for i: 0..samples.count - 1 samples[i] += dry_synth[i] * 1.18;
-    apply_reverb_to_signal(samples, reverbed_synth, dry_gain = 0.86, wet_gain = 0.58);
-    for i: 0..samples.count - 1 samples[i] += bass[i] * 0.88;
-
-    normalize(samples, 0.95);
-    return samples;
-}
-
-hihat_fill_beat_for_bar :: (bar_index: int) -> int {
-    h := randomish_u32(cast(u32) bar_index, 0xA511E9B3);
-    if (h & 3) != 0 return -1;
-    return cast(int) ((h >> 8) % 4);
-}
-
-randomish_u32 :: (value: u32, seed: u32) -> u32 {
-    x := value + seed;
-    x = (x ^ (x >> 16)) * 0x7FEB352D;
-    x = (x ^ (x >> 15)) * 0x846CA68B;
-    x = x ^ (x >> 16);
-    return x;
-}
-
-apply_repeating_low_pass_sweep :: (samples: [] float, bpm: int) {
-    filter: Low_Pass;
-    low_pass_init(*filter, cast(float) SAMPLE_RATE_HZ);
-
-    seconds_per_beat := 60.0 / cast(float) bpm;
-    cycle_samples := cast(int) (4.0 * 4.0 * seconds_per_beat * cast(float) SAMPLE_RATE_HZ + 0.5);
-    if cycle_samples < 1 cycle_samples = 1;
-
-    for i: 0..samples.count - 1 {
-        cycle_index := i % cycle_samples;
-        progress := cast(float) cycle_index / cast(float) max(1, cycle_samples - 1);
-        filter.frequency = linear_interpolate(12000.0, 650.0, progress);
-        samples[i] = low_pass_process(*filter, samples[i]);
-    }
-}
-
-// these don't have to be functions
-
-// 16 bars
-
-synth_pulse_pattern_notation :: () -> string {
-    notation := #string END
-[ 0 0 - 0 ] [ - 0 0 0 ] [ 0 0 - 0 ] [ - 0 0 0 ]
-[ 8, 8, - 8, ] [ - 8, 8, 8, ] [ 8, 8, - 8, ] [ - 8, 8, 8, ]
-[ 3, 3, - 3, ] [ - 3, 3, 3, ] [ 3, 3, - 3, ] [ - 3, 3, 3, ]
-[ 7, 7, - 7, ] [ - 7, 7, 7, ] [ 7, 7, - 7, ] [ - 7, 7, 7, ]
-END
-    return notation;
-}
-
-// 16 bars
-
-synth_pattern_notation :: () -> string {
-    notation := #string END
-[ 0 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ 2 ~ 3 ~ ]
-[ 8 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ 8 ~ 10 ~ ]
-[ 3 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ 3 ~ 5 ~ ]
-[ 2 ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
-END
-    return notation;
-}
-
-// 32 bars
-
-intro_melody_phrase_notation :: () -> string {
-    notation := #string END
-[ 0 7, 2 7, ] [ 3 7, 5 7, ] [ 3 7, 0 7, ] [ 2 7, 7, 7, ] 
-[ 3 10, 5 10, ] [ 7 10, 8 10,] [ 7 10, 3 10, ] [ 5 10, 10, 10,]
-[ 7 2 8 2 ] [ 10 2 0' 2 ] [ 10 2 7 2 ] [ 8 2 2 2 ] 
-[ 10 5 0' 5 ] [ 2' 5 3' 5 ] [ 2' 5 10 5 ] [ 0' 5 5 5 ]
-[ 0' 7 2' 7 ] [ 3' 7 5' 7 ] [ 3' 7 0' 7 ] [ 2' 7 7 7 ]
-[ 8 3 10 3 ] [ 0' 3 2' 3 ] [ 0' 3 8 3 ] [ 10 3 3 3 ]
-[ 5 0 7 0 ] [ 8 0 10 0 ] [ 8 0 5 0 ] [ 7 0 0 0 ] 
-[ 2 10, 3 10, ] [ 5 10, 7 10, ] [ 5 10, 2 10, ] [ 3 10,  10, ]
-END
-    return notation;
-}
-
-// 16 bars
-
-later_melody_phrase_notation :: () -> string {
-    notation := #string END
-[ 7 ~ ~ ~ ] [ 7 ~ ~ ~ ] [ - - - - ] [ 0' ~ 2' ~ ]
-[ 3' ~ 2' ~ ] [ - - - - ] [ - - - - ] [ 3 ~ 2 ~ ]
-[ 3 ~ 2 ~ ] [ - - - - ] [ - - - - ] [ 10 ~ 7 ~ ]
-[ - - - - ] [ - - - - ] [ - - - - ] [ - - - - ]
-END
-    return notation;
-}
-
-// 16 bars
-
-bass_pattern_notation :: () -> string {
-    notation := #string END
-[ 8,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
-[ 5,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
-[ 0,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
-[ 10,, ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ] [ ~ ~ ~ ~ ]
-END
-    return notation;
-}
-
-// 32 bars
-
-breakdown_melody_notation :: () -> string {
-    notation := #string END
-0' 7   2'  3' 
-8  ~   3'  5'
-7' 10  7'  8'
-(5' 10) ~ ~ ~
-
-0' 10   2'  3' 
-8  ~   3'  5'
-7' 3  7'  8'
-(5' 2) ~ ~ ~
-
-END
-    return notation;
 }
 
 parse_note_pattern :: (notation: string, duration_mode: Note_Duration_Mode, duration_sixteenths: float) -> [..] Note_Event {
     events: [..] Note_Event;
     current_sixteenth := 0;
     cursor := 0;
-    inside_beat := false;
+    bracket_depth := 0;
 
     while cursor < notation.count {
         c := notation[cursor];
 
         if c == #char "[" {
-            inside_beat = true;
+            bracket_depth += 1;
             cursor += 1;
             continue;
         }
 
         if c == #char "]" {
-            inside_beat = false;
+            if bracket_depth > 0 bracket_depth -= 1;
             cursor += 1;
             continue;
         }
@@ -598,7 +437,7 @@ parse_note_pattern :: (notation: string, duration_mode: Note_Duration_Mode, dura
             continue;
         }
 
-        token_sixteenths := ifx inside_beat then 1 else 4;
+        token_sixteenths := ifx bracket_depth > 0 then 1 else 4;
 
         if c == #char "-" {
             if duration_mode == .UNTIL_NEXT_NOTE {
@@ -710,19 +549,19 @@ parse_relative_note :: (notation: string, cursor: *int) -> int {
 count_note_pattern_sixteenths :: (notation: string) -> int {
     sixteenth_count := 0;
     cursor := 0;
-    inside_beat := false;
+    bracket_depth := 0;
 
     while cursor < notation.count {
         c := notation[cursor];
 
         if c == #char "[" {
-            inside_beat = true;
+            bracket_depth += 1;
             cursor += 1;
             continue;
         }
 
         if c == #char "]" {
-            inside_beat = false;
+            if bracket_depth > 0 bracket_depth -= 1;
             cursor += 1;
             continue;
         }
@@ -732,7 +571,7 @@ count_note_pattern_sixteenths :: (notation: string) -> int {
             continue;
         }
 
-        token_sixteenths := ifx inside_beat then 1 else 4;
+        token_sixteenths := ifx bracket_depth > 0 then 1 else 4;
 
         if c == #char "-" || c == #char "~" {
             sixteenth_count += token_sixteenths;
@@ -949,6 +788,13 @@ white_noise :: (state: *Noise_State) -> float {
     v := (state.value >> 8) & 0xFFFF;
     return (cast(float) v / 32767.5) - 1.0;
 }
+
+midi_note_to_frequency :: (midi_note: int) -> float {
+    return 440.0 * pow(2.0, cast(float) (midi_note - 69) / 12.0);
+}
+
+#load "song_one.jai";
+#load "song_two.jai";
 
 #import "Basic";
 #import "File";
